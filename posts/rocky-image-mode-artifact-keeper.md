@@ -96,6 +96,8 @@ The full set after bootstrapping, all created with `is_public: true` so edge nod
 
 The whole bootstrap is one idempotent shell script in the repo, and it also mints a scoped API token for CI pushes so nothing in the pipeline uses the admin password.
 
+![Artifact Keeper repositories view listing the RPM proxy and hosted repos and the OCI hosted and proxy repos](images/rocky-image-mode-artifact-keeper/01-repositories.png)
+
 ## Step 2: Building the base when the distro has no official bootc image
 
 Here is the first surprise. As of October 2026, **Rocky Linux publishes no official bootc base image.** `quay.io/rockylinux/rockylinux` has no `-bootc` tags, there is no image-mode page on docs.rockylinux.org, and the 10.2 release notes only mention that Cockpit's Image Builder can now emit bootable container images. CIQ sells bootc images for its Rocky Linux from CIQ product behind a subscription, and a community member rebuilds an unofficial one daily. What does exist is the recipe: the RESF SIG/Containers repository [`rocky-bootc`](https://git.resf.org/sig_containers/rocky-bootc), branch `r10`, which wraps the Fedora `bootc-base-images` tooling.
@@ -201,7 +203,11 @@ Now `docker.io/library/nginx:alpine` becomes a request for `/v2/oci-dockerhub-pr
 
 Building the RPM is `rpmbuild` in a `rockylinux:10` container (again pulled through the quay.io proxy, again with dnf pointed only at Artifact Keeper), about five seconds per release. Uploading is one `PUT` per file. One thing to know: re-uploading a file name that already exists returns **HTTP 409** and keeps the stored file, even if your local bytes differ. Treat NEVRAs as immutable and bump the release, which is good practice anyway.
 
+![The hosted rpm-edge-site repository in Artifact Keeper showing edge-site-config releases 1.0-1 and 1.0-2](images/rocky-image-mode-artifact-keeper/04-rpm-edge-site.png)
+
 Final numbers for the edge image: 75 layers, 463 MB compressed, 11 packages and 38 MB downloaded on top of the base. The edge build takes about 23 seconds cold and 8 seconds for a site-config bump, and pushes take one to four seconds because the 68 base layers are already in `oci-bootc`. We push `rocky-edge:10.2-1` and `rocky-edge:10.2-2` as immutable tags and point the floating `rocky-edge:10` at the first one with a registry-side `skopeo copy`. Promotion is moving that tag.
+
+![The oci-bootc repository showing rocky-bootc-base and the rocky-edge tags 10, 10.2-1 and 10.2-2 with their digests](images/rocky-image-mode-artifact-keeper/02-oci-bootc-tags.png)
 
 ## Step 4: Kickstart onto bare metal
 
@@ -276,6 +282,8 @@ OK: nginx-demo runs nginx:alpine @ sha256:df221db8..., and that manifest is cach
 ```
 
 Every image the cluster pulled, from `rancher/hardened-calico` to the demo's `nginx:alpine`, is now cached in `oci-dockerhub-proxy`, visible in the Artifact Keeper UI next to the RPMs and the OS image that produced the node. One place to look.
+
+![The oci-dockerhub-proxy repository showing nginx and every rancher/* RKE2 system image cached after the first boot](images/rocky-image-mode-artifact-keeper/03-dockerhub-proxy-cache.png)
 
 ## Step 5: Day-2 is a tag move
 
