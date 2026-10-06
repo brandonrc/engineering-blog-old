@@ -13,6 +13,8 @@ OpenTeams spends most of its days on AI and ML and the infrastructure that runs 
 
 Two invitations before we start. If you run deployments that have grown complicated and you suspect a system like this could simplify them, I would like to hear about them; my contact is at the bottom, and we can work out where Artifact Keeper fits. And if you are a nerd like me who wants to try this in a home lab, I want to hear how that goes just as much.
 
+Last, a thank you to Edward Mora for putting Artifact Keeper to work at his company. This post is my open version of what I believe he built internally, and it would not exist without that example.
+
 ## The problem: four sources of truth
 
 Every box in an edge fleet should be running the same operating system, the same Kubernetes, and the same site configuration, and you should be able to prove it. That is harder than it sounds. With a package-based install, two machines start to drift the first time someone runs `dnf update` on one of them and not the other. Image mode fixes this at the operating system layer. With [bootc](https://bootc-dev.github.io/bootc/) (a tool that boots and updates a Linux system from a container image), the whole operating system is built with a Containerfile, nodes boot it, and upgrading means pointing them at a new image. Rocky Linux image mode is this idea on Rocky Linux.
