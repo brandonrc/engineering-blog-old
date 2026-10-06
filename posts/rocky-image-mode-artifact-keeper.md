@@ -21,7 +21,7 @@ This post walks through a proof of concept that collapses all of that into one p
 - the Rocky bootc base image we build ourselves, and the final edge image layered on top of it, in a **hosted OCI registry**
 - the container images the cluster runs, through **OCI pull-through proxies** for Docker Hub and quay.io
 
-A bare-metal node boots the stock Rocky installer with a kickstart file, pulls the edge image from Artifact Keeper, and comes up running RKE2. Day-2 is a `bootc upgrade` against the same registry. A second pass signs every RPM and image and makes every consumer verify, with an unsigned image refused at the build, the install, and the upgrade. Everything here is reproducible from [**github.com/brandonrc/rocky-custom-baremetal-deployment**](https://github.com/brandonrc/rocky-custom-baremetal-deployment); the "bare metal" in our run is a QEMU virtual machine, and the scripts use KVM when it is available and fall back to software emulation when it is not.
+A bare-metal node boots the stock Rocky installer with a kickstart file, pulls the edge image from Artifact Keeper, and comes up running RKE2. Day-2 is a `bootc upgrade` against the same registry. A second pass signs every RPM and image and makes every consumer verify, with an unsigned image refused at the build, the install, and the upgrade. Everything here is reproducible from [**github.com/brandonrc/rocky-custom-baremetal-deployment**](https://github.com/brandonrc/rocky-custom-baremetal-deployment), and the full technical reference (environment setup, architecture, every finding and timing) lives in its [documentation site](https://brandonrc.github.io/rocky-custom-baremetal-deployment/). The "bare metal" in our run is a virtual machine driven by the repo's scripts; nothing in the pipeline knows the difference.
 
 ```mermaid
 graph LR
@@ -104,7 +104,7 @@ Here is the first surprise. As of October 2026, **Rocky Linux publishes no offic
 
 So we build the base ourselves. This turns out to be a feature, not a workaround, because now the base image's RPMs come through Artifact Keeper too.
 
-The recipe is a two-stage Containerfile. A `rockylinux:10` builder installs `rpm-ostree`, runs `bootc-base-imagectl build-rootfs` from the treefile manifests, and exports a chunked OCI archive into a bind-mounted directory; the second stage is `FROM oci-archive:./out.ociarchive`. It needs `--cap-add=all --device /dev/fuse --security-opt=label=disable` because rpm-ostree composes a root filesystem inside the build. We expected that to require rootful podman. It did not: the recipe built unmodified under rootless podman 5.8 in under five minutes.
+The recipe is a two-stage Containerfile. A `rockylinux:10` builder installs `rpm-ostree`, runs `bootc-base-imagectl build-rootfs` from the treefile manifests, and exports a chunked OCI archive into a bind-mounted directory; the second stage is `FROM oci-archive:./out.ociarchive`. It needs `--cap-add=all --device /dev/fuse --security-opt=label=disable` because rpm-ostree composes a root filesystem inside the build. The recipe built unmodified under rootless podman in under five minutes, which matters if you want this in a CI runner.
 
 We changed three things, all in our own wrapper Containerfile, with the vendored upstream recipe untouched:
 
@@ -211,9 +211,9 @@ Final numbers for the edge image: 75 layers, 463 MB compressed, 11 packages and 
 
 ## Step 4: Kickstart onto bare metal
 
-With the image in the registry, deploying a node is the oldest trick in the Enterprise Linux book: network-boot the stock installer and hand it a kickstart. No custom ISO, no disk image to copy around, no `bootc-image-builder` (which needs rootful podman anyway). Anaconda in Rocky 10.2 knows how to pull a bootc image and deploy it as the payload.
+With the image in the registry, deploying a node is the oldest trick in the Enterprise Linux book: network-boot the stock installer and hand it a kickstart. No custom ISO, no disk image to copy around, no `bootc-image-builder`. Anaconda in Rocky 10.2 knows how to pull a bootc image and deploy it as the payload.
 
-We boot the installer's own `vmlinuz` and `initrd.img` from the Rocky 10.2 mirror's `images/pxeboot/` directory, point `inst.stage2` at the mirror, and serve the kickstart over HTTP from the workstation. In a real rack that is a PXE server and a DHCP option; in our harness it is a QEMU command line and `python3 -m http.server`. The kickstart is the interesting part:
+We boot the installer's own `vmlinuz` and `initrd.img` from the Rocky 10.2 mirror's `images/pxeboot/` directory, point `inst.stage2` at the mirror, and serve the kickstart over HTTP. In a real rack that is a PXE server and a DHCP option; in our harness it is a small HTTP server next to the VM. The kickstart is the interesting part:
 
 ```text
 #| highlight: 10-17, 19, 22
@@ -250,17 +250,14 @@ Two findings from this step:
 
 **Mark the registry insecure in both places.** Anaconda pulls the image inside the installer environment, so the `registries.conf.d` drop-in has to exist there (`%pre`). The installed system needs the same drop-in for `bootc upgrade`, so the `edge-site-config` RPM bakes it into the image, and the kickstart writes it into the installed `/etc` as well. In production you would terminate TLS at Artifact Keeper's Caddy front door and distribute the CA instead; the mechanics are the same.
 
-What happens on power-on. These numbers are from the first iteration under QEMU software emulation, because this workstation had hardware virtualization disabled at the time; the KVM numbers at the end of the post are about five times faster:
+What happens on power-on:
 
-| Milestone | Time from power-on |
+| Milestone | Time |
 |---|---|
-| Installer running (kernel, initrd and stage2 fetched over HTTPS) | 315 s |
-| Kickstart applied, storage configured | 375 s |
-| Image pulled from Artifact Keeper and deployed (74 layers, 463 MB) | 570 s |
-| Installer exits, machine reboots | 601 s |
-| SSH answers on the installed system | 52 s |
-| RKE2 node Ready | 324 s |
-| Demo workload Running | about 400 s |
+| Installer boots, applies the kickstart, pulls and deploys the image, reboots | 65 s |
+| SSH answers on the installed system | 25 s after power-on |
+| RKE2 node Ready | 61 s after SSH |
+| Demo workload Running | shortly after |
 
 The verification script then runs over SSH, and this is the output that makes the whole exercise worthwhile:
 
@@ -390,7 +387,7 @@ What is still missing is TLS. Signatures protect the content end to end over pla
 
 **The registry-as-source-of-truth idea holds up.** By the end, Artifact Keeper held the base OS packages, the Kubernetes packages, our site package, the base image, two edge image releases, and every container image the cluster pulled, and the node had never contacted anything else except the Rocky mirror for the installer itself. "What is running on node 37?" is now `bootc status` on the node and a digest lookup in one registry. Promotion is a tag copy, rollback is built in, a site-config change costs each node 7.8 MB, and after the second iteration every RPM, every repodata file and every image is signed and verified at the point of use.
 
-**Image mode's failure modes are different from package mode's.** Neither of our two real bugs was visible in `podman build`, `podman run`, or `bootc container lint`. A read-only `/opt` only matters once the root filesystem is actually read-only, and a missing finalize-time dependency only matters at the first upgrade. If you adopt image mode, your CI needs a stage that boots the image and upgrades it, not just builds it. Our QEMU harness is that stage.
+**Image mode's failure modes are different from package mode's.** Neither of our two real bugs was visible in `podman build`, `podman run`, or `bootc container lint`. A read-only `/opt` only matters once the root filesystem is actually read-only, and a missing finalize-time dependency only matters at the first upgrade. If you adopt image mode, your CI needs a stage that boots the image and upgrades it, not just builds it. The VM harness in the repo is that stage.
 
 **Rocky is early here.** No official base image, a kickstart `bootc` command that mislabels files on 10.2, a minimal manifest without `bubblewrap`. None of these are hard to work around, and the RESF recipe building rootless on the first try was a pleasant surprise. Expect this to settle quickly; check whether an official image exists before copying our `base/` directory.
 
@@ -398,18 +395,18 @@ What is still missing is TLS. Signatures protect the content end to end over pla
 
 What is left for production: terminate TLS at Artifact Keeper and distribute the CA instead of marking the registry insecure; give the registry one DNS name so the signing policy needs no `exactRepository` workaround; pin cosign or move to podman's native sigstore signing before the legacy format disappears; install nodes by digest and let them track the tag afterwards; serve the installer kernel, initrd and stage2 from the registry too, so even the PXE media has one source; and block egress, since RKE2's generated `hosts.toml` keeps `registry-1.docker.io` as a fallback.
 
-Timings for the curious. The first iteration ran under QEMU software emulation because this workstation had hardware virtualization disabled in firmware; the second ran with KVM after flipping that BIOS switch, which is the realistic number:
+Timings for the curious, from the final run:
 
-| Stage | KVM | Software emulation |
-|---|---|---|
-| Kickstart install, power-on to installer exit | 65 s | 601 s |
-| First boot to SSH | 25 s | 52 s |
-| SSH to Kubernetes node Ready | 61 s | 272 s |
-| `bootc upgrade` pull and stage | 6 s | 69 s |
-| Reboot to SSH after upgrade | 20 s | 148 s |
-| Base image build (rootless) | 211 s | |
-| Edge image build, cold / site-config bump | 23 s / 8 s | |
+| Stage | Time |
+|---|---|
+| Kickstart install, power-on to installer exit | 65 s |
+| First boot to SSH | 25 s |
+| SSH to Kubernetes node Ready | 61 s |
+| `bootc upgrade` pull and stage | 6 s |
+| Reboot to SSH after upgrade | 20 s |
+| Base image build (rootless) | 211 s |
+| Edge image build, cold / site-config bump | 23 s / 8 s |
 
-With KVM, power-on to a working, signed, verified Kubernetes node is about three minutes, and the slowest part of the install turned out to be downloading the installer's 750 MB stage2 from the mirror, so the harness now caches and serves that locally too.
+Power-on to a working, signed, verified Kubernetes node is about three minutes. The slowest part of the install turned out to be downloading the installer's 750 MB stage2 from the mirror, so the harness caches and serves that locally too. A fuller breakdown, including earlier runs, is in the [timings page](https://brandonrc.github.io/rocky-custom-baremetal-deployment/timings/) of the repo's documentation.
 
-Everything, including the harness that produced these numbers, is in [github.com/brandonrc/rocky-custom-baremetal-deployment](https://github.com/brandonrc/rocky-custom-baremetal-deployment). `make all` generates keys, builds, signs and pushes everything; `make vm-install vm-boot vm-verify vm-upgrade-unsigned vm-upgrade vm-rollback` walks the node through its whole life, refused upgrade included.
+Everything, including the harness that produced these numbers, is in [github.com/brandonrc/rocky-custom-baremetal-deployment](https://github.com/brandonrc/rocky-custom-baremetal-deployment), with setup instructions and the complete findings on its [documentation site](https://brandonrc.github.io/rocky-custom-baremetal-deployment/). `make all` generates keys, builds, signs and pushes everything; `make vm-install vm-boot vm-verify vm-upgrade-unsigned vm-upgrade vm-rollback` walks the node through its whole life, refused upgrade included.
