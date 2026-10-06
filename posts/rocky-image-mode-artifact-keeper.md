@@ -5,7 +5,7 @@ authors:
 - brandon-geraci
 categories:
 - Engineering
-meta_description: "Build a custom Rocky Linux 10 bootc image, serve the RPMs and the image from one Artifact Keeper registry, and kickstart it onto edge nodes that boot straight into Kubernetes."
+meta_description: "Build a signed Rocky Linux 10 bootc image, serve RPMs, images and keys from one Artifact Keeper registry, and kickstart it onto edge nodes that boot straight into Kubernetes."
 focus_keyword: Rocky Linux image mode
 ---
 
@@ -21,7 +21,7 @@ This post walks through a proof of concept that collapses all of that into one p
 - the Rocky bootc base image we build ourselves, and the final edge image layered on top of it, in a **hosted OCI registry**
 - the container images the cluster runs, through **OCI pull-through proxies** for Docker Hub and quay.io
 
-A bare-metal node boots the stock Rocky installer with a kickstart file, pulls the edge image from Artifact Keeper, and comes up running RKE2. Day-2 is a `bootc upgrade` against the same registry. Everything here is reproducible from [**github.com/brandonrc/rocky-custom-baremetal-deployment**](https://github.com/brandonrc/rocky-custom-baremetal-deployment); the "bare metal" in our run is a QEMU virtual machine, and the scripts use KVM when it is available and fall back to software emulation when it is not.
+A bare-metal node boots the stock Rocky installer with a kickstart file, pulls the edge image from Artifact Keeper, and comes up running RKE2. Day-2 is a `bootc upgrade` against the same registry. A second pass signs every RPM and image and makes every consumer verify, with an unsigned image refused at the build, the install, and the upgrade. Everything here is reproducible from [**github.com/brandonrc/rocky-custom-baremetal-deployment**](https://github.com/brandonrc/rocky-custom-baremetal-deployment); the "bare metal" in our run is a QEMU virtual machine, and the scripts use KVM when it is available and fall back to software emulation when it is not.
 
 ```mermaid
 graph LR
@@ -250,7 +250,7 @@ Two findings from this step:
 
 **Mark the registry insecure in both places.** Anaconda pulls the image inside the installer environment, so the `registries.conf.d` drop-in has to exist there (`%pre`). The installed system needs the same drop-in for `bootc upgrade`, so the `edge-site-config` RPM bakes it into the image, and the kickstart writes it into the installed `/etc` as well. In production you would terminate TLS at Artifact Keeper's Caddy front door and distribute the CA instead; the mechanics are the same.
 
-What happens on power-on, under software emulation with no KVM (so these numbers are pessimistic by roughly a factor of five):
+What happens on power-on. These numbers are from the first iteration under QEMU software emulation, because this workstation had hardware virtualization disabled at the time; the KVM numbers at the end of the post are about five times faster:
 
 | Milestone | Time from power-on |
 |---|---|
@@ -314,29 +314,102 @@ Finalizing SELinux policy: Failed to execute child process "/usr/bin/bwrap"
 
 At shutdown, ostree finalizes the staged deployment and, because `rke2-selinux` adds policy modules so `/etc/selinux` differs from the image's, it rebuilds the SELinux policy by running `semodule` inside bubblewrap. The RESF minimal base does not include `bubblewrap`, no package declares a dependency on it (libostree calls `/usr/bin/bwrap` by hard-coded path), and our base build never noticed because the builder container had it as a dependency of rpm-ostree. The community image ships it, apparently for exactly this reason. We proved the diagnosis on the live node by temporarily overlaying `/usr` with `bootc usr-overlay` and installing the package; the next upgrade went through. The fix is one more package in the Containerfile, plus a tmpfiles.d entry for `/var/log/journal` so the journal persists across boots and the next person does not have to find this in a serial log.
 
+## Step 6: Sign everything, verify everywhere
+
+Everything so far ran with `gpgcheck=0` and `--no-signature-verification`, which is fine for a lab and unacceptable for a fleet. The second iteration removes both. The rule is simple: Artifact Keeper stores the signatures and the public keys next to the artifacts, and every consumer verifies.
+
+| Artifact | Signed by | Signature lives in | Verified by |
+|---|---|---|---|
+| `edge-site-config` RPM | our GPG key, `rpmsign` in the build container | the RPM header | dnf `gpgcheck=1` during the image build |
+| `rpm-edge-site` repodata | Artifact Keeper's managed key | `repodata/repomd.xml.asc` | dnf `repo_gpgcheck=1` |
+| Proxied Rocky and RKE2 RPMs | the vendors | RPM headers and upstream `repomd.xml.asc`, passed through the proxy | dnf `gpgcheck=1`, `repo_gpgcheck=1` |
+| Base and edge images | our cosign key, by digest, after every push | `oci-bootc`, as a `sha256-<digest>.sig` tag | `policy.json` on the build host, in the installer, and on the node |
+| Public keys | n/a | a generic Artifact Keeper repo, `raw-edge-keys` | fetched by the build, the kickstart, and shipped in the image |
+
+**What Artifact Keeper does here.** Two things it does natively: it signs the repodata of a hosted RPM repo with a key you create through its signing API, serving `repomd.xml.asc` and `repomd.xml.key`, and its proxies pass upstream `repomd.xml.asc` through byte for byte, so the Rocky and RKE2 repos get `repo_gpgcheck=1` for free. It does not sign OCI images itself in v1.10.2. What it provides for images is a registry that stores whatever cosign pushes: the legacy `.sig` tag, and the newer referrers-API bundles. A generic repo serves the public keys over anonymous HTTP.
+
+**The cosign detail that cost an afternoon.** cosign 3 defaults to the new Sigstore bundle format attached through the referrers API. Artifact Keeper stored it correctly, `cosign verify` passed, and podman, skopeo, bootc and Anaconda all said `A signature was required, but no signature exists`. The containers-image stack still reads only the older "sigstore attachment" format, the `sha256-<digest>.sig` tag. So we sign with the deprecated flags, and the deprecation warning is the real risk in this design:
+
+```bash
+#| command-line
+#| data-filter-output: (out)
+cosign sign --yes --key signing/keys/cosign.key --allow-http-registry --allow-insecure-registry \
+  --tlog-upload=false --new-bundle-format=false --use-signing-config=false \
+  localhost:30080/oci-bootc/rocky-edge@sha256:d4f3ec69...
+(out)Flag --new-bundle-format has been deprecated, this will be the only supported format in future versions
+(out)Pushing signature to: localhost:30080/oci-bootc/rocky-edge
+```
+
+`podman push --sign-by-sigstore-private-key` writes the same format natively and is the safer long-term choice.
+
+**The policy that enforces it.** The node ships this in `/etc/containers/policy.json`, with the public key at `/etc/pki/containers/edge-cosign.pub` and a `registries.d` entry turning on `use-sigstore-attachments` for the registry. Default `reject`, one exception:
+
+```json
+{
+  "default": [{"type": "reject"}],
+  "transports": {
+    "docker": {
+      "10.0.2.2:30080/oci-bootc/rocky-edge": [{
+        "type": "sigstoreSigned",
+        "keyPath": "/etc/pki/containers/edge-cosign.pub",
+        "signedIdentity": {"type": "exactRepository",
+                           "dockerRepository": "localhost:30080/oci-bootc/rocky-edge"}
+      }]
+    }
+  }
+}
+```
+
+Two non-obvious lines. `signedIdentity` is required because cosign records a tag-less identity that the default matching rule never accepts. And it names `localhost:30080`, the signer's view of the registry, not `10.0.2.2:30080`, the node's view. In production you would give the registry one DNS name everywhere and this collapses to `matchRepository`.
+
+The kickstart writes the same three files in `%pre` before `ostreecontainer` runs, fetching the public key from Artifact Keeper. Which leads to the finding of this step: **removing `--no-signature-verification` from the kickstart does nothing by itself.** With our `%pre` policy in place, an unsigned image is refused even with the flag added back; with the installer's stock policy, an unsigned image installs fine without the flag. The policy file is the switch.
+
+**Proof, both directions.** Each consumer was tested with an image that is not signed:
+
+```text
+# podman build FROM the unsigned base, on the build host
+Error: creating build container: unable to copy from source docker://localhost:30080/oci-bootc/rocky-bootc-base:unsigned:
+Source image rejected: A signature was required, but no signature exists
+
+# kickstart install of rocky-edge:unsigned-test (serial console, 40 s in)
+error: Performing deployment: Preparing import: Fetching manifest:
+failed to invoke method OpenImage: A signature was required, but no signature exists
+
+# bootc upgrade on the node after promoting the unsigned image to :10
+error: Upgrading: Preparing import: Fetching manifest:
+failed to invoke method OpenImage: A signature was required, but no signature exists
+```
+
+After the refused upgrade the node stayed on its signed deployment, nothing was staged, and RKE2 never noticed. An image signed with the wrong key fails with `invalid signature when validating ASN.1 encoded signature`; an unsigned RPM fails the build with `GPG check FAILED`; repodata signed with an unknown key fails with `Signing key not found`. Then the signed images went through the full install, upgrade and rollback run again, now with signatures checked at every hop. Promotion is still a plain tag copy: the signature is bound to the digest, so `rocky-edge:10` verifies the moment it points at a signed build.
+
+Two more gotchas for anyone repeating this. Signatures follow digests, so a "new unsigned tag" of an identical image is still signed, and a verified image carries its signatures in local storage, so pushing it onward needs `--remove-signatures`. And `skopeo inspect` ignores `policy.json` entirely; test enforcement with `skopeo copy` or `podman pull`.
+
+What is still missing is TLS. Signatures protect the content end to end over plain HTTP, but tag-to-digest resolution, the unsigned EPEL metadata, and the first fetch of the public key all trust the network. Terminating TLS at Artifact Keeper's Caddy front door and distributing its CA is the next iteration, and it touches every registry address in the pipeline, which is why it is a separate step.
+
 ## What we learned
 
-**The registry-as-source-of-truth idea holds up.** By the end, Artifact Keeper held the base OS packages, the Kubernetes packages, our site package, the base image, two edge image releases, and every container image the cluster pulled, and the node had never contacted anything else except the Rocky mirror for the installer itself. "What is running on node 37?" is now `bootc status` on the node and a digest lookup in one registry. Promotion is a tag copy, rollback is built in, and a site-config change costs each node 7.8 MB.
+**The registry-as-source-of-truth idea holds up.** By the end, Artifact Keeper held the base OS packages, the Kubernetes packages, our site package, the base image, two edge image releases, and every container image the cluster pulled, and the node had never contacted anything else except the Rocky mirror for the installer itself. "What is running on node 37?" is now `bootc status` on the node and a digest lookup in one registry. Promotion is a tag copy, rollback is built in, a site-config change costs each node 7.8 MB, and after the second iteration every RPM, every repodata file and every image is signed and verified at the point of use.
 
 **Image mode's failure modes are different from package mode's.** Neither of our two real bugs was visible in `podman build`, `podman run`, or `bootc container lint`. A read-only `/opt` only matters once the root filesystem is actually read-only, and a missing finalize-time dependency only matters at the first upgrade. If you adopt image mode, your CI needs a stage that boots the image and upgrades it, not just builds it. Our QEMU harness is that stage.
 
 **Rocky is early here.** No official base image, a kickstart `bootc` command that mislabels files on 10.2, a minimal manifest without `bubblewrap`. None of these are hard to work around, and the RESF recipe building rootless on the first try was a pleasant surprise. Expect this to settle quickly; check whether an official image exists before copying our `base/` directory.
 
-**Artifact Keeper is young too, and honest about it.** The compose defaults refuse to start until you generate secrets, repos are private by default, and the docs lag the code in places (ports, upload paths, a `visibility` field that is really `is_public`). Once running, it did everything we asked, and the proxy types made the "one place" story possible without mirroring anything by hand.
+**Artifact Keeper is young too, and honest about it.** The compose defaults refuse to start until you generate secrets, repos are private by default, and the docs lag the code in places (ports, upload paths, a `visibility` field that is really `is_public`). Once running, it did everything we asked: the proxy types made the "one place" story possible without mirroring anything by hand, its repodata signing and its signature pass-through made `repo_gpgcheck=1` nearly universal, and its OCI registry stored cosign signatures in both formats without complaint. Image signing itself stays in the pipeline with cosign, which is where it belongs.
 
-What we would change for production: terminate TLS at Artifact Keeper and distribute the CA instead of marking the registry insecure; sign the images and drop `--no-signature-verification`; install nodes by digest and let them track the tag afterwards; serve the installer kernel and initrd from the registry too, so even the PXE media has one source; and block egress, since RKE2's generated `hosts.toml` keeps `registry-1.docker.io` as a fallback.
+What is left for production: terminate TLS at Artifact Keeper and distribute the CA instead of marking the registry insecure; give the registry one DNS name so the signing policy needs no `exactRepository` workaround; pin cosign or move to podman's native sigstore signing before the legacy format disappears; install nodes by digest and let them track the tag afterwards; serve the installer kernel, initrd and stage2 from the registry too, so even the PXE media has one source; and block egress, since RKE2's generated `hosts.toml` keeps `registry-1.docker.io` as a fallback.
 
-Timings for the curious, all under QEMU software emulation because this workstation had hardware virtualization disabled in firmware (with KVM, expect roughly a fifth of these):
+Timings for the curious. The first iteration ran under QEMU software emulation because this workstation had hardware virtualization disabled in firmware; the second ran with KVM after flipping that BIOS switch, which is the realistic number:
 
-| Stage | Time |
-|---|---|
-| Kickstart install, power-on to installer exit | 601 s |
-| First boot to SSH | 52 s |
-| SSH to Kubernetes node Ready | 272 s |
-| Demo workload Running after Ready | 76 s |
-| `bootc upgrade` pull and stage | 69 s |
-| Reboot to SSH after upgrade or rollback | 148 s |
-| Base image build (rootless) | 211 s |
-| Edge image build, cold / site-config bump | 23 s / 8 s |
+| Stage | KVM | Software emulation |
+|---|---|---|
+| Kickstart install, power-on to installer exit | 65 s | 601 s |
+| First boot to SSH | 25 s | 52 s |
+| SSH to Kubernetes node Ready | 61 s | 272 s |
+| `bootc upgrade` pull and stage | 6 s | 69 s |
+| Reboot to SSH after upgrade | 20 s | 148 s |
+| Base image build (rootless) | 211 s | |
+| Edge image build, cold / site-config bump | 23 s / 8 s | |
 
-Everything, including the harness that produced these numbers, is in [github.com/brandonrc/rocky-custom-baremetal-deployment](https://github.com/brandonrc/rocky-custom-baremetal-deployment). `make all` builds and pushes the images; `make vm-install vm-boot vm-verify vm-upgrade vm-rollback` walks the node through its whole life.
+With KVM, power-on to a working, signed, verified Kubernetes node is about three minutes, and the slowest part of the install turned out to be downloading the installer's 750 MB stage2 from the mirror, so the harness now caches and serves that locally too.
+
+Everything, including the harness that produced these numbers, is in [github.com/brandonrc/rocky-custom-baremetal-deployment](https://github.com/brandonrc/rocky-custom-baremetal-deployment). `make all` generates keys, builds, signs and pushes everything; `make vm-install vm-boot vm-verify vm-upgrade-unsigned vm-upgrade vm-rollback` walks the node through its whole life, refused upgrade included.
