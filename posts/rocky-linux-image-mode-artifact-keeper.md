@@ -432,6 +432,10 @@ Power-on to a working, signed, verified Kubernetes node is about three minutes. 
 
 Everything, including the harness that produced these numbers, is in [github.com/brandonrc/rocky-custom-baremetal-deployment](https://github.com/brandonrc/rocky-custom-baremetal-deployment), with setup instructions and the complete findings on its [documentation site](https://brandonrc.github.io/rocky-custom-baremetal-deployment/). `make all` generates keys, builds, signs and pushes everything. `make vm-all` walks a node through install, verification, a refused unsigned upgrade, a real upgrade, and rollback.
 
+## What's next for Artifact Keeper
+
+Dogfooding Artifact Keeper this hard produced a handful of improvements, which is part of why we do these projects. The compose and documentation fixes are already in, so the quickstart you land on matches what this post describes. The [1.11.0 release](https://github.com/artifact-keeper/artifact-keeper/issues/4468) adds signature-aware views for OCI repositories, so cosign signatures show up on the image they belong to instead of as separate tags, corrects the storage accounting for shared layers, and adds server-side image signing, which turns the cosign step in Step 6 into a registry setting. The full list of what came out of this project is on the [Artifact Keeper notes](https://brandonrc.github.io/rocky-custom-baremetal-deployment/artifact-keeper-notes/) page.
+
 ---
 
 If your deployments have grown complicated and you think one registry could simplify them, or you try this in a home lab, I would like to hear about it: bgeraci@openteams.com.
