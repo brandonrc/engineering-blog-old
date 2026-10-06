@@ -1,11 +1,11 @@
 ---
-title: "Rocky Linux Image Mode on Bare Metal: One Registry for OS and K8s"
+title: "Bare-Metal Rocky Linux Image Mode with Artifact Keeper"
 slug: rocky-linux-image-mode-artifact-keeper
 authors:
 - brandon-geraci
 categories:
 - Engineering
-meta_description: "Rocky Linux image mode on bare metal: kickstart a signed bootc image with RKE2 from one Artifact Keeper registry, then upgrade it with a 7.8 MB tag move."
+meta_description: "Deploy Rocky Linux image mode to bare metal with Artifact Keeper as the single source of truth for RPMs, signed bootc images, keys and Kubernetes workloads."
 focus_keyword: Rocky Linux image mode
 ---
 
@@ -57,13 +57,13 @@ The [architecture page](https://brandonrc.github.io/rocky-custom-baremetal-deplo
 
 ## Step 1: Stand up Artifact Keeper as the single registry
 
-Artifact Keeper ships a `docker-compose.yml` that brings up Postgres, OpenSearch, the Rust backend, the Next.js UI, and a Caddy front door on port 30080. We ran it under rootless podman. It came up in about a minute from cold. Three things the quickstart does not mention:
+Artifact Keeper ships a `docker-compose.yml` that brings up Postgres, OpenSearch, the Rust backend, the Next.js UI, and a Caddy front door on port 30080. We ran it under rootless podman and it was serving in about a minute. Three settings shape the rest of the walkthrough:
 
-1. **The compose defaults are fatal.** `JWT_SECRET=change-me-in-production-please` is on a placeholder denylist in the backend and is rejected outright, and the `AK_WEBHOOK_SECRET_KEY` placeholder makes the backend `exit(1)`. You must generate both before first start. Our `up.sh` does `openssl rand -base64 48` and `-base64 32` and also sets `ADMIN_PASSWORD`, which skips the first-boot setup lock.
-2. **Repositories are private by default.** Anonymous `dnf` or `podman pull` gets a 404 until you create the repository with `is_public: true`.
-3. **The OCI registry is path-based.** Images live at `host:30080/<repo-id>/<image>:<tag>`; the first path segment selects the repository. The guides' `localhost:8080/...` examples do not match the compose file, which publishes 30080 and never exposes 8080.
+1. **Generate the secrets before first start.** `JWT_SECRET` and `AK_WEBHOOK_SECRET_KEY` must be real values; our `up.sh` creates them with `openssl rand` and sets `ADMIN_PASSWORD` so the instance comes up ready to use, with no interactive setup.
+2. **Make the edge repositories public.** Repositories are private by default, which is right for a registry. Edge nodes need anonymous reads, so every repository in this walkthrough is created with `is_public: true`.
+3. **The OCI registry is path-based.** Images live at `host:30080/<repo-id>/<image>:<tag>`; the first path segment selects the repository, which is what lets one registry host separate image repositories with their own policies.
 
-With that out of the way, bootstrapping is a handful of `POST /api/v1/repositories` calls. Remote RPM repositories need a concrete `baseurl` (no mirrorlists), and the server generates `repodata` for hosted repositories itself, with no `createrepo` involved:
+Bootstrapping is a handful of `POST /api/v1/repositories` calls. Remote RPM repositories need a concrete `baseurl` (no mirrorlists), and the server generates `repodata` for hosted repositories itself, with no `createrepo` involved:
 
 ```bash
 curl -X POST http://localhost:30080/api/v1/repositories \
@@ -109,7 +109,7 @@ The full set after bootstrapping, all created with `is_public: true` so edge nod
 | `oci-quay-proxy`, `oci-dockerhub-proxy` | OCI | proxy | quay.io, registry-1.docker.io |
 | `raw-edge-keys` | generic | hosted | public keys (added in Step 6) |
 
-The whole bootstrap is one idempotent shell script in the repo. It also mints a scoped API token, so routine pushes and uploads never use the admin password. Everything else we learned about Artifact Keeper along the way, including the API calls that worked and the places the docs lag the code, is in the [Artifact Keeper notes](https://brandonrc.github.io/rocky-custom-baremetal-deployment/artifact-keeper-notes/).
+The whole bootstrap is one idempotent shell script in the repo. It also mints a scoped API token, so routine pushes and uploads never use the admin password. The API calls and settings used throughout are collected in the [Artifact Keeper notes](https://brandonrc.github.io/rocky-custom-baremetal-deployment/artifact-keeper-notes/).
 
 ![Artifact Keeper repositories view listing the RPM proxy and hosted repositories and the OCI hosted and proxy repositories](images/rocky-linux-image-mode-artifact-keeper/01-repositories.png)
 
@@ -352,7 +352,7 @@ Because uploads are write-once, the signed rebuild got new release numbers: `edg
 
 ### What Artifact Keeper does here
 
-Two things it does natively: it signs the repodata of a hosted RPM repository with a key you create through its signing API, serving `repomd.xml.asc` and `repomd.xml.key`, and its proxies pass upstream `repomd.xml.asc` through byte for byte, so the Rocky and RKE2 repositories get `repo_gpgcheck=1` for free. Those repodata signatures expire after seven days and are re-signed on request, which a mirror that copies them once should know. It does not sign OCI images itself in v1.10.2. What it provides for images is a registry that stores whatever cosign pushes, and a generic repository that serves the public keys over anonymous HTTP. The [what Artifact Keeper does here](https://brandonrc.github.io/rocky-custom-baremetal-deployment/artifact-keeper/) page spells out the boundaries, including what this proof of concept skips for production.
+Two things it does natively: it signs the repodata of a hosted RPM repository with a key you create through its signing API, serving `repomd.xml.asc` and `repomd.xml.key`, and its proxies pass upstream `repomd.xml.asc` through byte for byte, so the Rocky and RKE2 repositories get `repo_gpgcheck=1` for free. Those repodata signatures expire after seven days and are re-signed on request, which a mirror that copies them once should know. For images, it stores whatever cosign pushes next to the image, and its generic repository serves the public keys over anonymous HTTP, so image signing stays in your pipeline with cosign and Artifact Keeper is the place signatures and keys live. The [what Artifact Keeper does here](https://brandonrc.github.io/rocky-custom-baremetal-deployment/artifact-keeper/) page spells out each role.
 
 ### The cosign detail that cost an afternoon
 
@@ -422,9 +422,9 @@ What is still missing is TLS. Signatures protect the content end to end over pla
 
 **Build the base from the recipe.** Composing the Rocky bootc base ourselves took one wrapper Containerfile and under five minutes, and it is the reason every package in the OS can be traced to one registry. The few image-mode details we hit along the way, such as a kickstart command to avoid on 10.2, a read-only `/opt`, and a `bubblewrap` package to add, are all captured in the repo so you do not have to rediscover them.
 
-**Artifact Keeper is young, and honest about it.** The compose defaults refuse to start until you generate secrets, repositories are private by default, and the docs lag the code in places. Once running, it did everything we asked: the proxy types made the "one place" story possible without mirroring anything by hand, its repodata signing and signature pass-through made `repo_gpgcheck=1` nearly universal, and its OCI registry stored cosign signatures in both formats without complaint. Image signing itself stays in the pipeline with cosign, which is where it belongs.
+**Artifact Keeper is what makes the one-place story work.** Its RPM proxies put the OS and Kubernetes packages behind one address without mirroring anything by hand. Its hosted RPM repository generates and signs the metadata for our own package. Its OCI registry holds the base image, the edge image releases, and their cosign signatures, and its Docker Hub and quay.io proxies catch every workload image the cluster pulls. Its generic repository serves the public keys. Promotion is a tag copy inside the registry, and `bootc upgrade`, dnf, podman and the installer all verify against it.
 
-What is left for production: terminate TLS at Artifact Keeper and distribute the CA instead of marking the registry insecure; give the registry one DNS name so the signing policy needs no `exactRepository` workaround; pin cosign or move to podman's native sigstore signing before the legacy format disappears; install nodes by digest and let them track the tag afterwards; serve the installer kernel, initrd and stage2 from the registry too, so even the PXE media has one source; and block egress, since RKE2's generated `hosts.toml` keeps `registry-1.docker.io` as a fallback.
+From here the hardening is deployment choices rather than new machinery: terminate TLS at Artifact Keeper's Caddy front door and distribute the CA; give the registry one DNS name so the signing policy is a plain `matchRepository`; install nodes by digest and let them track the tag; serve the installer kernel, initrd and stage2 from the registry too; and block egress at the edge. The [adapting page](https://brandonrc.github.io/rocky-custom-baremetal-deployment/adapting/) walks through each.
 
 Power-on to a working, signed, verified Kubernetes node is about three minutes. The slowest part of the install turned out to be downloading the installer's 750 MB stage2 from the mirror, so the harness caches and serves that locally too. The full numbers, stage by stage, are on the [timings page](https://brandonrc.github.io/rocky-custom-baremetal-deployment/timings/).
 
