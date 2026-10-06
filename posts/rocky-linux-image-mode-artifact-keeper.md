@@ -111,7 +111,7 @@ The full set after bootstrapping, all created with `is_public: true` so edge nod
 
 The whole bootstrap is one idempotent shell script in the repo. It also mints a scoped API token, so routine pushes and uploads never use the admin password. Everything else we learned about Artifact Keeper along the way, including the API calls that worked and the places the docs lag the code, is in the [Artifact Keeper notes](https://brandonrc.github.io/rocky-custom-baremetal-deployment/artifact-keeper-notes/).
 
-![Artifact Keeper repositories view listing the RPM proxy and hosted repositories and the OCI hosted and proxy repositories](images/rocky-image-mode-artifact-keeper/01-repositories.png)
+![Artifact Keeper repositories view listing the RPM proxy and hosted repositories and the OCI hosted and proxy repositories](images/rocky-linux-image-mode-artifact-keeper/01-repositories.png)
 
 ## Step 2: Build a Rocky Linux image mode base yourself
 
@@ -218,11 +218,11 @@ Now `docker.io/library/nginx:alpine` becomes a request for `/v2/oci-dockerhub-pr
 
 Building the RPM is `rpmbuild` in a `rockylinux:10` container (again pulled through the quay.io proxy, again with dnf pointed only at Artifact Keeper), about five seconds per release. Uploading is one `PUT` per file. One thing to know: re-uploading a file name that already exists returns **HTTP 409** and keeps the stored file, even if your local bytes differ. Treat each name-version-release as immutable and bump the release, which is good practice anyway.
 
-![The hosted rpm-edge-site repository in Artifact Keeper showing the edge-site-config releases](images/rocky-image-mode-artifact-keeper/04-rpm-edge-site.png)
+![The hosted rpm-edge-site repository in Artifact Keeper showing the edge-site-config releases](images/rocky-linux-image-mode-artifact-keeper/04-rpm-edge-site.png)
 
 Final numbers for the edge image: 76 layers and 463 MB compressed, a dozen packages on top of the base. The edge build takes under half a minute cold and 8 seconds for a site-config bump, and pushes take a few seconds because the 68 base layers are already in `oci-bootc`. We push `rocky-edge:10.2-3` and `rocky-edge:10.2-4` as immutable tags and point the floating `rocky-edge:10` at the first one with a registry-side `skopeo copy`. Promotion is moving that tag.
 
-![The oci-bootc repository showing the Rocky Linux image mode base and the rocky-edge tags with their digests and cosign signature tags](images/rocky-image-mode-artifact-keeper/02-oci-bootc-tags.png)
+![The oci-bootc repository showing the Rocky Linux image mode base and the rocky-edge tags with their digests and cosign signature tags](images/rocky-linux-image-mode-artifact-keeper/02-oci-bootc-tags.png)
 
 ## Step 4: Kickstart the image onto bare metal
 
@@ -304,7 +304,7 @@ OK: nginx-demo runs nginx:alpine @ sha256:df221db8..., and that manifest is cach
 
 Every image the cluster pulled, from `rancher/hardened-calico` to the demo's `nginx:alpine`, is now cached in `oci-dockerhub-proxy`, visible in the Artifact Keeper UI next to the RPMs and the OS image that produced the node.
 
-![The oci-dockerhub-proxy repository showing nginx and every rancher RKE2 system image cached after the first boot](images/rocky-image-mode-artifact-keeper/03-dockerhub-proxy-cache.png)
+![The oci-dockerhub-proxy repository showing nginx and every rancher RKE2 system image cached after the first boot](images/rocky-linux-image-mode-artifact-keeper/03-dockerhub-proxy-cache.png)
 
 ## Step 5: Day-2 is a tag move
 
