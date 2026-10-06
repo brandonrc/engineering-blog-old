@@ -1,0 +1,16 @@
+# The social brief for posts/rocky-image-mode-artifact-keeper.md. It's used to write the LinkedIn post.
+# Answer each question yourself or with your AI assistant (see Social Brief in
+# README.md). The PR can merge once all four are answered.
+
+# What problem does this article solve? (1-2 sentences)
+problem: "Edge fleets drift when the OS, Kubernetes, and site config each come from a different place, and nobody can say exactly what is running on a given node."
+
+# What does the article build, test, compare, or argue? (1-2 sentences)
+what_it_does: "Builds a custom Rocky Linux 10 bootc image with RKE2, serves every RPM, image, and container pull from one Artifact Keeper registry, kickstarts it onto a bare-metal node, and runs a 7.8 MB day-2 upgrade and rollback."
+
+# If readers remember one thing, what should it be? (1 sentence)
+remember_one_thing: "Image mode bugs hide until the root filesystem is really read-only and the first upgrade finalizes, so boot and upgrade the image in CI, not just build it."
+
+# Who should read this? Pick one or more:
+# data-scientists, ml-ai-engineers, python-developers, platform-devops-engineers, security-compliance-engineers, oss-maintainers, engineering-leaders
+audience: ["platform-devops-engineers", "security-compliance-engineers", "engineering-leaders"]
